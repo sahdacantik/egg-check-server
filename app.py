@@ -201,6 +201,20 @@ def health():
 def predict():
     file = request.files["image"]
 
+    # ─────────────────────────────────────────────
+    # THRESHOLD DINAMIS (dikirim dari Flutter)
+    # Default fallback ke nilai semhas jika tidak dikirim
+    # ─────────────────────────────────────────────
+    try:
+        thr_low  = float(request.form.get("threshold_low",  0.45))
+        thr_high = float(request.form.get("threshold_high", 0.80))
+    except (ValueError, TypeError):
+        thr_low, thr_high = 0.45, 0.80
+
+    # Validasi range supaya tidak kebalik
+    thr_low  = max(0.01, min(thr_low,  0.99))
+    thr_high = max(thr_low + 0.01, min(thr_high, 0.99))
+
     img_bytes = np.frombuffer(file.read(), np.uint8)
     img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
 
@@ -208,6 +222,7 @@ def predict():
         return jsonify({"error": "Gambar tidak bisa dibaca"}), 400
 
     print(f"IMAGE shape: {img.shape}")
+    print(f"[THRESHOLD] low={thr_low:.2f}  high={thr_high:.2f}")
 
     eggs = detect_eggs_from_array(img)
     print(f"Telur terdeteksi: {len(eggs)}")
@@ -215,7 +230,6 @@ def predict():
     results = []
     for i, egg in enumerate(eggs):
 
-        # Encode crop berwarna untuk UI
         egg_display = cv2.resize(egg, (224, 224))
         _, buffer = cv2.imencode(
             '.jpg', egg_display,
@@ -223,7 +237,6 @@ def predict():
         )
         crop_b64 = base64.b64encode(buffer).decode('utf-8')
 
-        # Preprocessing → model
         processed = preprocess_image_from_array(egg)
         processed = processed.astype('float32') / 255.0
         processed = np.expand_dims(processed, axis=0)
@@ -233,26 +246,19 @@ def predict():
         tingkat_kelayakan = prob_normal * 100
 
         # ─────────────────────────────
-        # 3 ZONA KELAYAKAN
-        # Sesuai proposal: sistem menampilkan
-        # confidence level, bukan hanya binary
-        #
-        # LAYAK      : prob_retak < 0.40
-        # PERLU CEK  : prob_retak 0.40 – 0.65
-        #              (borderline, model tidak yakin)
-        # TIDAK LAYAK: prob_retak > 0.65
+        # 3 ZONA — pakai threshold dinamis
         # ─────────────────────────────
-        if prob_retak < 0.45:
+        if prob_retak < thr_low:
             status = "Normal"
-            zona = "LAYAK"
+            zona   = "LAYAK"
             is_normal = True
-        elif prob_retak < 0.80:
+        elif prob_retak < thr_high:
             status = "Meragukan"
-            zona = "PERLU CEK"
+            zona   = "PERLU CEK"
             is_normal = True
         else:
             status = "Retak"
-            zona = "TIDAK LAYAK"
+            zona   = "TIDAK LAYAK"
             is_normal = False
 
         confidence = tingkat_kelayakan if is_normal else prob_retak * 100
@@ -275,8 +281,8 @@ def predict():
             "crop_image": crop_b64,
         })
 
-    layak = sum(1 for r in results if r["zona"] == "LAYAK")
-    perlu_cek = sum(1 for r in results if r["zona"] == "PERLU CEK")
+    layak       = sum(1 for r in results if r["zona"] == "LAYAK")
+    perlu_cek   = sum(1 for r in results if r["zona"] == "PERLU CEK")
     tidak_layak = sum(1 for r in results if r["zona"] == "TIDAK LAYAK")
 
     return jsonify({
@@ -284,6 +290,9 @@ def predict():
         "layak": layak,
         "perlu_cek": perlu_cek,
         "tidak_layak": tidak_layak,
+        # kembalikan threshold yg dipakai, biar Flutter bisa tampilkan
+        "threshold_low":  round(thr_low,  2),
+        "threshold_high": round(thr_high, 2),
         "results": results
     })
 
