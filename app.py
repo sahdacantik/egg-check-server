@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import keras
+import tensorflow as tf
 import base64
 import os
 
@@ -14,7 +15,6 @@ model = keras.models.load_model(
 
 # ─────────────────────────────────────────────
 # PREPROCESSING
-# SAMA PERSIS dengan preprocess_image di Colab
 # ─────────────────────────────────────────────
 def preprocess_image_from_array(img):
     h_orig, w_orig = img.shape[:2]
@@ -22,9 +22,7 @@ def preprocess_image_from_array(img):
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-    # ─────────────────────────────────────────────
     # STEP 1 — DETEKSI & CROP TELUR
-    # ─────────────────────────────────────────────
     scale = 600 / max(h_orig, w_orig)
     img_small = cv2.resize(img, (int(w_orig*scale), int(h_orig*scale)))
     gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
@@ -55,32 +53,17 @@ def preprocess_image_from_array(img):
             crop = img[y1:y2, x1:x2]
             break
 
-    # ─────────────────────────────────────────────
     # STEP 2 — RESIZE
-    # ─────────────────────────────────────────────
     resized = cv2.resize(crop, (224, 224))
 
-    # ─────────────────────────────────────────────
     # STEP 3 — GRAYSCALE
-    # ─────────────────────────────────────────────
     gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
-    # ─────────────────────────────────────────────
-    # STEP 4 — CLAHE (LEBIH LEMBUT)
-    # clipLimit turun: 2.0 → 1.2
-    # tileGridSize lebih besar: (8,8) → (16,16)
-    # Efek: kontras lokal lebih halus, noise/bintik/kotoran
-    # tidak ikut "terangkat" jadi mirip retakan
-    # ─────────────────────────────────────────────
+    # STEP 4 — CLAHE
     clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16,16))
     enhanced = clahe.apply(gray_final)
 
-    # ─────────────────────────────────────────────
-    # STEP 5 — SHARPENING (LEBIH HALUS)
-    # Kernel lama: center=5 → terlalu agresif
-    # Kernel baru: center=3 → hanya perjelas tepi nyata,
-    # tidak amplifikasi noise permukaan
-    # ─────────────────────────────────────────────
+    # STEP 5 — SHARPENING
     kernel_sharpen = np.array([
         [ 0, -0.5,  0],
         [-0.5, 3.0, -0.5],
@@ -88,15 +71,100 @@ def preprocess_image_from_array(img):
     ], dtype=np.float32)
     sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
 
-    # ─────────────────────────────────────────────
     # STEP 6 — BACK TO RGB
-    # ─────────────────────────────────────────────
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
     return final
 
 
 # ─────────────────────────────────────────────
-# DETEKSI TELUR
+# GRADCAM
+# ─────────────────────────────────────────────
+def generate_gradcam(processed_input, original_display):
+    """
+    processed_input : array (224,224,3) float32 sudah /255, belum expand_dims
+    original_display: array (224,224,3) uint8 BGR — gambar yang akan di-overlay
+    return          : base64 string JPEG overlay
+    """
+    try:
+        # Cari layer Conv2D terakhir di MobileNetV2
+        last_conv_layer = None
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                last_conv_layer = layer.name
+                break
+
+        if last_conv_layer is None:
+            # Fallback: cari nama yang mengandung 'Conv_1' (layer terakhir MobileNetV2)
+            for layer in reversed(model.layers):
+                if 'Conv_1' in layer.name or 'conv' in layer.name.lower():
+                    last_conv_layer = layer.name
+                    break
+
+        if last_conv_layer is None:
+            print("[GradCAM] Tidak ada Conv layer ditemukan, skip")
+            return None
+
+        print(f"[GradCAM] Menggunakan layer: {last_conv_layer}")
+
+        # Buat gradient model
+        grad_model = tf.keras.models.Model(
+            inputs=model.input,
+            outputs=[
+                model.get_layer(last_conv_layer).output,
+                model.output
+            ]
+        )
+
+        input_tensor = np.expand_dims(processed_input, axis=0)
+        input_tensor = tf.cast(input_tensor, tf.float32)
+
+        with tf.GradientTape() as tape:
+            tape.watch(input_tensor)
+            conv_outputs, predictions = grad_model(input_tensor)
+            # Index 0 = prob_retak (sigmoid output)
+            loss = predictions[:, 0]
+
+        # Gradien terhadap output conv layer
+        grads = tape.gradient(loss, conv_outputs)
+
+        # Global average pooling gradien
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        # Bobot feature map
+        conv_outputs = conv_outputs[0]
+        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+
+        # Normalisasi ke 0-1
+        heatmap = heatmap.numpy()
+        heatmap = np.maximum(heatmap, 0)
+        if heatmap.max() > 0:
+            heatmap = heatmap / heatmap.max()
+
+        # Resize heatmap ke ukuran gambar
+        heatmap_resized = cv2.resize(heatmap, (224, 224))
+
+        # Colormap jet → overlay
+        heatmap_uint8 = np.uint8(255 * heatmap_resized)
+        heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+        # Overlay ke gambar asli (BGR)
+        overlay = cv2.addWeighted(original_display, 0.55, heatmap_colored, 0.45, 0)
+
+        # Encode ke base64
+        _, buffer = cv2.imencode(
+            '.jpg', overlay,
+            [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+        return base64.b64encode(buffer).decode('utf-8')
+
+    except Exception as e:
+        print(f"[GradCAM] Error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# DETEKSI TELUR (tidak berubah)
 # ─────────────────────────────────────────────
 def detect_eggs_from_array(image):
     h_img, w_img = image.shape[:2]
@@ -189,6 +257,7 @@ def detect_eggs_from_array(image):
     print("[DEBUG] Fallback: 1 telur")
     return [image]
 
+
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
@@ -201,17 +270,13 @@ def health():
 def predict():
     file = request.files["image"]
 
-    # ─────────────────────────────────────────────
-    # THRESHOLD DINAMIS (dikirim dari Flutter)
-    # Default fallback ke nilai semhas jika tidak dikirim
-    # ─────────────────────────────────────────────
+    # Threshold dinamis
     try:
         thr_low  = float(request.form.get("threshold_low",  0.45))
         thr_high = float(request.form.get("threshold_high", 0.80))
     except (ValueError, TypeError):
         thr_low, thr_high = 0.45, 0.80
 
-    # Validasi range supaya tidak kebalik
     thr_low  = max(0.01, min(thr_low,  0.99))
     thr_high = max(thr_low + 0.01, min(thr_high, 0.99))
 
@@ -230,6 +295,7 @@ def predict():
     results = []
     for i, egg in enumerate(eggs):
 
+        # ── Display crop (BGR, untuk UI) ──────────────
         egg_display = cv2.resize(egg, (224, 224))
         _, buffer = cv2.imencode(
             '.jpg', egg_display,
@@ -237,28 +303,27 @@ def predict():
         )
         crop_b64 = base64.b64encode(buffer).decode('utf-8')
 
+        # ── Preprocessing → model ─────────────────────
         processed = preprocess_image_from_array(egg)
-        processed = processed.astype('float32') / 255.0
-        processed = np.expand_dims(processed, axis=0)
+        processed_float = processed.astype('float32') / 255.0
 
-        prob_retak = float(model.predict(processed, verbose=0)[0][0])
+        input_tensor = np.expand_dims(processed_float, axis=0)
+        prob_retak = float(model.predict(input_tensor, verbose=0)[0][0])
         prob_normal = 1 - prob_retak
         tingkat_kelayakan = prob_normal * 100
 
-        # ─────────────────────────────
-        # 3 ZONA — pakai threshold dinamis
-        # ─────────────────────────────
+        # ── Zona klasifikasi ──────────────────────────
         if prob_retak < thr_low:
-            status = "Normal"
-            zona   = "LAYAK"
+            status    = "Normal"
+            zona      = "LAYAK"
             is_normal = True
         elif prob_retak < thr_high:
-            status = "Meragukan"
-            zona   = "PERLU CEK"
+            status    = "Meragukan"
+            zona      = "PERLU CEK"
             is_normal = True
         else:
-            status = "Retak"
-            zona   = "TIDAK LAYAK"
+            status    = "Retak"
+            zona      = "TIDAK LAYAK"
             is_normal = False
 
         confidence = tingkat_kelayakan if is_normal else prob_retak * 100
@@ -268,17 +333,29 @@ def predict():
             f"→ {zona} ({tingkat_kelayakan:.1f}%)"
         )
 
+        # ── GradCAM ───────────────────────────────────
+        # Hanya generate kalau PERLU CEK atau TIDAK LAYAK
+        # supaya tidak buang waktu untuk telur yang jelas LAYAK
+        gradcam_b64 = None
+        if zona in ("PERLU CEK", "TIDAK LAYAK"):
+            gradcam_b64 = generate_gradcam(processed_float, egg_display.copy())
+            if gradcam_b64:
+                print(f"  [GradCAM] Telur {i+1}: OK")
+            else:
+                print(f"  [GradCAM] Telur {i+1}: gagal/skip")
+
         results.append({
-            "egg": i + 1,
-            "status": status,
-            "zona": zona,
-            "confidence": round(confidence, 2),
+            "egg":              i + 1,
+            "status":           status,
+            "zona":             zona,
+            "confidence":       round(confidence, 2),
             "tingkat_kelayakan": round(tingkat_kelayakan, 2),
-            "layak": is_normal,
-            "isLayak": is_normal,
-            "normalProb": round(prob_normal * 100, 2),
-            "retakProb": round(prob_retak * 100, 2),
-            "crop_image": crop_b64,
+            "layak":            is_normal,
+            "isLayak":          is_normal,
+            "normalProb":       round(prob_normal * 100, 2),
+            "retakProb":        round(prob_retak * 100, 2),
+            "crop_image":       crop_b64,
+            "gradcam_image":    gradcam_b64,   # None kalau LAYAK
         })
 
     layak       = sum(1 for r in results if r["zona"] == "LAYAK")
@@ -286,14 +363,85 @@ def predict():
     tidak_layak = sum(1 for r in results if r["zona"] == "TIDAK LAYAK")
 
     return jsonify({
-        "total": len(results),
-        "layak": layak,
-        "perlu_cek": perlu_cek,
-        "tidak_layak": tidak_layak,
-        # kembalikan threshold yg dipakai, biar Flutter bisa tampilkan
+        "total":          len(results),
+        "layak":          layak,
+        "perlu_cek":      perlu_cek,
+        "tidak_layak":    tidak_layak,
         "threshold_low":  round(thr_low,  2),
         "threshold_high": round(thr_high, 2),
-        "results": results
+        "results":        results
+    })
+
+
+# ─────────────────────────────────────────────
+# ENDPOINT KHUSUS DETAIL CHECK (3 sudut)
+# Dipanggil dari detail_check_screen.dart
+# Menerima 1 foto, return predict + GradCAM
+# ─────────────────────────────────────────────
+@app.route("/predict_single", methods=["POST"])
+def predict_single():
+    """
+    Endpoint ringan untuk mode detail check (single egg, 1 foto per call).
+    Tidak ada deteksi nampan — langsung preprocess → predict → GradCAM.
+    """
+    file = request.files.get("image")
+    if file is None:
+        return jsonify({"error": "Tidak ada gambar"}), 400
+
+    try:
+        thr_low  = float(request.form.get("threshold_low",  0.45))
+        thr_high = float(request.form.get("threshold_high", 0.80))
+    except (ValueError, TypeError):
+        thr_low, thr_high = 0.45, 0.80
+
+    thr_low  = max(0.01, min(thr_low,  0.99))
+    thr_high = max(thr_low + 0.01, min(thr_high, 0.99))
+
+    img_bytes = np.frombuffer(file.read(), np.uint8)
+    img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return jsonify({"error": "Gambar tidak bisa dibaca"}), 400
+
+    # Display
+    egg_display = cv2.resize(img, (224, 224))
+    _, buffer = cv2.imencode('.jpg', egg_display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    crop_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    # Preprocess
+    processed = preprocess_image_from_array(img)
+    processed_float = processed.astype('float32') / 255.0
+
+    input_tensor = np.expand_dims(processed_float, axis=0)
+    prob_retak = float(model.predict(input_tensor, verbose=0)[0][0])
+    prob_normal = 1 - prob_retak
+    tingkat_kelayakan = prob_normal * 100
+
+    if prob_retak < thr_low:
+        zona      = "LAYAK"
+        is_normal = True
+    elif prob_retak < thr_high:
+        zona      = "PERLU CEK"
+        is_normal = True
+    else:
+        zona      = "TIDAK LAYAK"
+        is_normal = False
+
+    confidence = tingkat_kelayakan if is_normal else prob_retak * 100
+
+    # GradCAM selalu di-generate untuk detail check
+    gradcam_b64 = generate_gradcam(processed_float, egg_display.copy())
+
+    return jsonify({
+        "zona":             zona,
+        "prob_retak":       round(prob_retak * 100, 2),
+        "prob_normal":      round(prob_normal * 100, 2),
+        "tingkat_kelayakan": round(tingkat_kelayakan, 2),
+        "confidence":       round(confidence, 2),
+        "crop_image":       crop_b64,
+        "gradcam_image":    gradcam_b64,
+        "threshold_low":    round(thr_low,  2),
+        "threshold_high":   round(thr_high, 2),
     })
 
 
