@@ -80,37 +80,35 @@ def preprocess_image_from_array(img):
 # GRADCAM
 # ─────────────────────────────────────────────
 def generate_gradcam(processed_input, original_display):
-    """
-    processed_input : array (224,224,3) float32 sudah /255, belum expand_dims
-    original_display: array (224,224,3) uint8 BGR — gambar yang akan di-overlay
-    return          : base64 string JPEG overlay
-    """
     try:
-        # Cari layer Conv2D terakhir di MobileNetV2
+        # Ambil sub-model MobileNetV2 (nested Functional model)
+        base_model = None
+        for layer in model.layers:
+            if isinstance(layer, tf.keras.Model):
+                base_model = layer
+                break
+
+        if base_model is None:
+            print("[GradCAM] Base model (MobileNetV2) tidak ditemukan, skip")
+            return None
+
+        # Cari Conv2D terakhir DI DALAM base_model
         last_conv_layer = None
-        for layer in reversed(model.layers):
+        for layer in reversed(base_model.layers):
             if isinstance(layer, tf.keras.layers.Conv2D):
                 last_conv_layer = layer.name
                 break
 
         if last_conv_layer is None:
-            # Fallback: cari nama yang mengandung 'Conv_1' (layer terakhir MobileNetV2)
-            for layer in reversed(model.layers):
-                if 'Conv_1' in layer.name or 'conv' in layer.name.lower():
-                    last_conv_layer = layer.name
-                    break
-
-        if last_conv_layer is None:
-            print("[GradCAM] Tidak ada Conv layer ditemukan, skip")
+            print("[GradCAM] Tidak ada Conv layer ditemukan di base_model, skip")
             return None
 
-        print(f"[GradCAM] Menggunakan layer: {last_conv_layer}")
+        print(f"[GradCAM] Menggunakan layer: {last_conv_layer} (di dalam {base_model.name})")
 
-        # Buat gradient model
         grad_model = tf.keras.models.Model(
             inputs=model.input,
             outputs=[
-                model.get_layer(last_conv_layer).output,
+                base_model.get_layer(last_conv_layer).output,
                 model.output
             ]
         )
@@ -121,41 +119,27 @@ def generate_gradcam(processed_input, original_display):
         with tf.GradientTape() as tape:
             tape.watch(input_tensor)
             conv_outputs, predictions = grad_model(input_tensor)
-            # Index 0 = prob_retak (sigmoid output)
             loss = predictions[:, 0]
 
-        # Gradien terhadap output conv layer
         grads = tape.gradient(loss, conv_outputs)
-
-        # Global average pooling gradien
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-        # Bobot feature map
         conv_outputs = conv_outputs[0]
         heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
 
-        # Normalisasi ke 0-1
         heatmap = heatmap.numpy()
         heatmap = np.maximum(heatmap, 0)
         if heatmap.max() > 0:
             heatmap = heatmap / heatmap.max()
 
-        # Resize heatmap ke ukuran gambar
         heatmap_resized = cv2.resize(heatmap, (224, 224))
-
-        # Colormap jet → overlay
         heatmap_uint8 = np.uint8(255 * heatmap_resized)
         heatmap_colored = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
 
-        # Overlay ke gambar asli (BGR)
         overlay = cv2.addWeighted(original_display, 0.55, heatmap_colored, 0.45, 0)
 
-        # Encode ke base64
-        _, buffer = cv2.imencode(
-            '.jpg', overlay,
-            [cv2.IMWRITE_JPEG_QUALITY, 85]
-        )
+        _, buffer = cv2.imencode('.jpg', overlay, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return base64.b64encode(buffer).decode('utf-8')
 
     except Exception as e:
