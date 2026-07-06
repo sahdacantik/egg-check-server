@@ -13,6 +13,11 @@ model = keras.models.load_model(
     compile=False
 )
 
+# ── WARM-UP: paksa model "terbangun" sepenuhnya sebelum dipakai ──
+_dummy_input = tf.zeros((1, 224, 224, 3), dtype=tf.float32)
+_ = model(_dummy_input)
+print("[STARTUP] Model warmed up, input shape defined.")
+
 # ─────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────
