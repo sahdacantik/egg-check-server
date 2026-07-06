@@ -86,18 +86,19 @@ def preprocess_image_from_array(img):
 # ─────────────────────────────────────────────
 def generate_gradcam(processed_input, original_display):
     try:
-        # Ambil sub-model MobileNetV2 (nested Functional model)
+        # Pisahkan base_model (MobileNetV2) dan head_layers (GAP, Dense, Dropout, Dense_1)
         base_model = None
+        head_layers = []
         for layer in model.layers:
             if isinstance(layer, tf.keras.Model):
                 base_model = layer
-                break
+            else:
+                head_layers.append(layer)
 
         if base_model is None:
-            print("[GradCAM] Base model (MobileNetV2) tidak ditemukan, skip")
+            print("[GradCAM] Base model tidak ditemukan, skip")
             return None
 
-        # Cari Conv2D terakhir DI DALAM base_model
         last_conv_layer = None
         for layer in reversed(base_model.layers):
             if isinstance(layer, tf.keras.layers.Conv2D):
@@ -105,16 +106,18 @@ def generate_gradcam(processed_input, original_display):
                 break
 
         if last_conv_layer is None:
-            print("[GradCAM] Tidak ada Conv layer ditemukan di base_model, skip")
+            print("[GradCAM] Conv layer tidak ditemukan di base_model, skip")
             return None
 
         print(f"[GradCAM] Menggunakan layer: {last_conv_layer} (di dalam {base_model.name})")
 
+        # PENTING: grad_model cukup sampai base_model saja
+        # base_model.input SUDAH pasti terdefinisi karena dia model Functional mandiri
         grad_model = tf.keras.models.Model(
-            inputs=model.input,
+            inputs=base_model.input,
             outputs=[
                 base_model.get_layer(last_conv_layer).output,
-                model.output
+                base_model.output
             ]
         )
 
@@ -123,7 +126,13 @@ def generate_gradcam(processed_input, original_display):
 
         with tf.GradientTape() as tape:
             tape.watch(input_tensor)
-            conv_outputs, predictions = grad_model(input_tensor)
+            conv_outputs, base_features = grad_model(input_tensor)
+
+            # Lanjutkan manual lewat head layers (GAP -> Dense -> Dropout -> Dense_1)
+            x = base_features
+            for layer in head_layers:
+                x = layer(x)
+            predictions = x
             loss = predictions[:, 0]
 
         grads = tape.gradient(loss, conv_outputs)
