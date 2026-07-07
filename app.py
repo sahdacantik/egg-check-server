@@ -172,6 +172,7 @@ def preprocess_image_from_array(img, use_hough_first=False):
         print("[Preprocess] WARNING: semua metode segmentasi gagal, pakai center-crop 64%")
 
     # STEP 2 — RESIZE
+    crop_for_display = crop.copy()
     resized = cv2.resize(crop, (224, 224))
 
     # STEP 3 — GRAYSCALE
@@ -191,7 +192,8 @@ def preprocess_image_from_array(img, use_hough_first=False):
 
     # STEP 6 — BACK TO RGB
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
-    return final
+    crop_display_resized = cv2.resize(crop_for_display, (224, 224))
+    return final, crop_display_resized 
 
 # ─────────────────────────────────────────────
 # GRADCAM
@@ -405,22 +407,17 @@ def predict():
     results = []
     for i, egg in enumerate(eggs):
 
-        # ── Display crop (BGR, untuk UI) ──────────────
-        egg_display = cv2.resize(egg, (224, 224))
+        # ── Preprocessing → model (skrg return 2 nilai) ──
+        processed, crop_display = preprocess_image_from_array(egg)
+        processed_float = processed.astype('float32') / 255.0
+
+        # ── Display crop (BGR, untuk UI) — SEKARANG JUJUR ──
         _, buffer = cv2.imencode(
-            '.jpg', egg_display,
+            '.jpg', crop_display,
             [cv2.IMWRITE_JPEG_QUALITY, 80]
         )
         crop_b64 = base64.b64encode(buffer).decode('utf-8')
-
-        # ── Preprocessing → model ─────────────────────
-        processed = preprocess_image_from_array(egg)
-        processed_float = processed.astype('float32') / 255.0
-
-        input_tensor = np.expand_dims(processed_float, axis=0)
-        prob_retak = float(model.predict(input_tensor, verbose=0)[0][0])
-        prob_normal = 1 - prob_retak
-        tingkat_kelayakan = prob_normal * 100
+        egg_display = crop_display  # dipakai juga sbg background GradCAM
 
         # ── Zona klasifikasi ──────────────────────────
         if prob_retak < thr_low:
@@ -513,14 +510,14 @@ def predict_single():
     if img is None:
         return jsonify({"error": "Gambar tidak bisa dibaca"}), 400
 
-    # Display
-    egg_display = cv2.resize(img, (224, 224))
-    _, buffer = cv2.imencode('.jpg', egg_display, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    crop_b64 = base64.b64encode(buffer).decode('utf-8')
-
-    # Preprocess
-    processed = preprocess_image_from_array(img, use_hough_first=True)
+    # Preprocess (skrg return 2 nilai)
+    processed, crop_display = preprocess_image_from_array(img, use_hough_first=True)
     processed_float = processed.astype('float32') / 255.0
+
+    # Display — SEKARANG JUJUR, nunjukkin crop yg beneran dipakai
+    _, buffer = cv2.imencode('.jpg', crop_display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    crop_b64 = base64.b64encode(buffer).decode('utf-8')
+    egg_display = crop_display
 
     input_tensor = np.expand_dims(processed_float, axis=0)
     prob_retak = float(model.predict(input_tensor, verbose=0)[0][0])
