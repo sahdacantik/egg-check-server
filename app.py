@@ -406,7 +406,7 @@ def predict():
     for i, egg in enumerate(eggs):
 
         # ── Preprocessing → model (return 2 nilai: tensor final + crop display) ──
-        processed, crop_display = preprocess_image_from_array(egg)
+        processed, crop_display = preprocess_image_from_array(egg, do_crop=False)
         processed_float = processed.astype('float32') / 255.0
 
         # ── Display crop (BGR, untuk UI) — SEKARANG JUJUR, sama dgn yg dipakai model ──
