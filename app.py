@@ -19,6 +19,73 @@ _ = model(_dummy_input)
 print("[STARTUP] Model warmed up, input shape defined.")
 
 # ─────────────────────────────────────────────
+# HELPER: SEGMENTASI TELUR BERBASIS BENTUK
+# (robust utk telur coklat/putih/biru, krn pakai shading+solidity, bukan warna)
+# ─────────────────────────────────────────────
+def _segment_egg_by_shape(img, scale, img_small, h_s, w_s):
+    """
+    Deteksi telur berbasis BENTUK (ellipse + solidity), bukan warna.
+    Robust untuk telur ayam coklat, ayam kampung putih, maupun bebek biru,
+    karena yang dipakai adalah gradasi shading (CLAHE+Canny) & kemulusan
+    kontur (convexity), bukan hue/saturasi.
+    """
+    gray_small = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray_small)
+    blurred = cv2.GaussianBlur(enhanced, (7, 7), 1.5)
+
+    edges = cv2.Canny(blurred, 25, 90)
+    kernel = np.ones((7, 7), np.uint8)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    img_area = h_s * w_s
+    best = None
+    best_score = 0
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 0.06 * img_area or area > 0.92 * img_area:
+            continue
+        if len(c) < 5:
+            continue  # fitEllipse butuh minimal 5 titik
+
+        hull = cv2.convexHull(c)
+        hull_area = cv2.contourArea(hull)
+        if hull_area <= 0:
+            continue
+        solidity = area / hull_area  # 1.0 = sempurna cembung
+
+        ellipse = cv2.fitEllipse(c)
+        (cx, cy), (MA, ma), angle = ellipse
+        aspect = max(MA, ma) / (min(MA, ma) + 1e-5)
+
+        # Telur: solid/cembung tinggi, aspect ratio wajar (bulat-lonjong)
+        if solidity < 0.85 or aspect > 1.6:
+            continue
+
+        score = solidity * (area / img_area)
+        if score > best_score:
+            best_score = score
+            best = ellipse
+
+    if best is None:
+        return None
+
+    (cx, cy), (MA, ma), angle = best
+    r = max(MA, ma) / 2
+    pad = r * 0.12
+    x1 = max(0, int((cx - r - pad) / scale))
+    y1 = max(0, int((cy - r - pad) / scale))
+    x2 = int((cx + r + pad) / scale)
+    y2 = int((cy + r + pad) / scale)
+    return x1, y1, x2, y2
+
+# ─────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────
 def preprocess_image_from_array(img, use_hough_first=False):
@@ -37,31 +104,40 @@ def preprocess_image_from_array(img, use_hough_first=False):
     crop = None
 
     if use_hough_first:
-        # STRATEGI KHUSUS DETAIL CHECK: HoughCircles duluan.
-        # Lebih tahan terhadap background polos berkontras rendah
-        # dibanding Canny, cocok untuk foto mentah 1 sudut (bukan hasil crop nampan).
-        r_min = int(min(h_s, w_s) / 6)
-        r_max = int(min(h_s, w_s) / 2.2)
-        circles = cv2.HoughCircles(
-            blur_small, cv2.HOUGH_GRADIENT,
-            dp=1.0, minDist=w_s,
-            param1=80, param2=35,
-            minRadius=r_min, maxRadius=r_max
-        )
-        if circles is not None:
-            circles = np.round(circles[0]).astype(int)
-            cx, cy, cr = max(circles, key=lambda c: c[2])
-            pad = int(cr * 0.15)
-            x1 = max(0, int((cx - cr - pad) / scale))
-            y1 = max(0, int((cy - cr - pad) / scale))
-            x2 = min(w_orig, int((cx + cr + pad) / scale))
-            y2 = min(h_orig, int((cy + cr + pad) / scale))
+        # 1) PRIORITAS UTAMA: shape+solidity — robust utk semua warna telur
+        seg = _segment_egg_by_shape(img, scale, img_small, h_s, w_s)
+        if seg is not None:
+            x1, y1, x2, y2 = seg
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_orig, x2), min(h_orig, y2)
             if (x2 - x1) > 30 and (y2 - y1) > 30:
                 crop = img[y1:y2, x1:x2]
-                print(f"[Preprocess] Crop via HoughCircles (detail check), radius={cr}")
+                print(f"[Preprocess] Crop via shape+solidity (detail check)")
+
+        # 2) FALLBACK: HoughCircles (kode lama, tetap dipertahankan)
+        if crop is None:
+            r_min = int(min(h_s, w_s) / 6)
+            r_max = int(min(h_s, w_s) / 2.2)
+            circles = cv2.HoughCircles(
+                blur_small, cv2.HOUGH_GRADIENT,
+                dp=1.0, minDist=w_s,
+                param1=80, param2=35,
+                minRadius=r_min, maxRadius=r_max
+            )
+            if circles is not None:
+                circles = np.round(circles[0]).astype(int)
+                cx, cy, cr = max(circles, key=lambda c: c[2])
+                pad = int(cr * 0.15)
+                x1 = max(0, int((cx - cr - pad) / scale))
+                y1 = max(0, int((cy - cr - pad) / scale))
+                x2 = min(w_orig, int((cx + cr + pad) / scale))
+                y2 = min(h_orig, int((cy + cr + pad) / scale))
+                if (x2 - x1) > 30 and (y2 - y1) > 30:
+                    crop = img[y1:y2, x1:x2]
+                    print(f"[Preprocess] Crop via HoughCircles (detail check), radius={cr}")
 
     if crop is None:
-        # STRATEGI DEFAULT (tidak berubah): deteksi kontur via Canny
+        # 3) FALLBACK: kontur via Canny (kode lama, tidak berubah)
         edges = cv2.Canny(blur_small, 30, 120)
         kernel = np.ones((9, 9), np.uint8)
         edges = cv2.dilate(edges, kernel, iterations=2)
@@ -86,19 +162,34 @@ def preprocess_image_from_array(img, use_hough_first=False):
                 break
 
     if crop is None:
-        crop = img.copy()
+        # 4) FALLBACK TERAKHIR: center-crop 64% area,
+        # jauh lebih aman drpd full-frame krn masih motong sudut2 background
+        cx1 = int(w_orig * 0.18)
+        cy1 = int(h_orig * 0.18)
+        cx2 = int(w_orig * 0.82)
+        cy2 = int(h_orig * 0.82)
+        crop = img[cy1:cy2, cx1:cx2]
+        print("[Preprocess] WARNING: semua metode segmentasi gagal, pakai center-crop 64%")
 
-    # STEP 2-6 tetap sama persis seperti sebelumnya
+    # STEP 2 — RESIZE
     resized = cv2.resize(crop, (224, 224))
+
+    # STEP 3 — GRAYSCALE
     gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    # STEP 4 — CLAHE
     clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16,16))
     enhanced = clahe.apply(gray_final)
+
+    # STEP 5 — SHARPENING
     kernel_sharpen = np.array([
         [ 0, -0.5,  0],
         [-0.5, 3.0, -0.5],
         [ 0, -0.5,  0]
     ], dtype=np.float32)
     sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+
+    # STEP 6 — BACK TO RGB
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
     return final
 
