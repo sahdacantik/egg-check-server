@@ -88,13 +88,35 @@ def _segment_egg_by_shape(img, scale, img_small, h_s, w_s):
 # ─────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────
-def preprocess_image_from_array(img, use_hough_first=False):
+def preprocess_image_from_array(img, use_hough_first=False, do_crop=True):
     h_orig, w_orig = img.shape[:2]
 
     if len(img.shape) == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-    # STEP 1 — DETEKSI & CROP TELUR
+    if not do_crop:
+        # Egg sudah diisolasi sebelumnya (via detect_eggs_from_array di jalur
+        # multi-egg) — jangan crop ulang, langsung pakai apa adanya biar tidak
+        # salah nemu sub-kontur di dalam crop yang sudah ketat.
+        crop = img.copy()
+        crop_for_display = crop.copy()
+        crop_display_resized = cv2.resize(crop_for_display, (224, 224))
+
+        resized = cv2.resize(crop, (224, 224))
+        gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16, 16))
+        enhanced = clahe.apply(gray_final)
+        kernel_sharpen = np.array([
+            [0, -0.5, 0],
+            [-0.5, 3.0, -0.5],
+            [0, -0.5, 0]
+        ], dtype=np.float32)
+        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+        final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
+        return final, crop_display_resized
+
+    # STEP 1 — DETEKSI & CROP TELUR (hanya jalan kalau do_crop=True,
+    # yaitu untuk /predict_single di mana input masih foto mentah utuh)
     scale = 600 / max(h_orig, w_orig)
     img_small = cv2.resize(img, (int(w_orig*scale), int(h_orig*scale)))
     h_s, w_s = img_small.shape[:2]
@@ -153,24 +175,24 @@ def preprocess_image_from_array(img, use_hough_first=False):
         crop = img.copy()
         print("[Preprocess] WARNING: fallback ke full frame (img.copy())")
 
-    # ── Simpan crop asli (BGR) SEBELUM diproses lebih lanjut, buat display/GradCAM ──
     crop_for_display = crop.copy()
     crop_display_resized = cv2.resize(crop_for_display, (224, 224))
 
-    # STEP 2-6 tetap sama persis seperti sebelumnya
     resized = cv2.resize(crop, (224, 224))
     gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16,16))
+    clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16, 16))
     enhanced = clahe.apply(gray_final)
     kernel_sharpen = np.array([
-        [ 0, -0.5,  0],
+        [0, -0.5, 0],
         [-0.5, 3.0, -0.5],
-        [ 0, -0.5,  0]
+        [0, -0.5, 0]
     ], dtype=np.float32)
     sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
 
     return final, crop_display_resized
+
+
 # ─────────────────────────────────────────────
 # GRADCAM
 # ─────────────────────────────────────────────
