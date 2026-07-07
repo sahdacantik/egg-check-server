@@ -104,40 +104,27 @@ def preprocess_image_from_array(img, use_hough_first=False):
     crop = None
 
     if use_hough_first:
-        # 1) PRIORITAS UTAMA: shape+solidity — robust utk semua warna telur
-        seg = _segment_egg_by_shape(img, scale, img_small, h_s, w_s)
-        if seg is not None:
-            x1, y1, x2, y2 = seg
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w_orig, x2), min(h_orig, y2)
+        r_min = int(min(h_s, w_s) / 6)
+        r_max = int(min(h_s, w_s) / 2.2)
+        circles = cv2.HoughCircles(
+            blur_small, cv2.HOUGH_GRADIENT,
+            dp=1.0, minDist=w_s,
+            param1=80, param2=35,
+            minRadius=r_min, maxRadius=r_max
+        )
+        if circles is not None:
+            circles = np.round(circles[0]).astype(int)
+            cx, cy, cr = max(circles, key=lambda c: c[2])
+            pad = int(cr * 0.15)
+            x1 = max(0, int((cx - cr - pad) / scale))
+            y1 = max(0, int((cy - cr - pad) / scale))
+            x2 = min(w_orig, int((cx + cr + pad) / scale))
+            y2 = min(h_orig, int((cy + cr + pad) / scale))
             if (x2 - x1) > 30 and (y2 - y1) > 30:
                 crop = img[y1:y2, x1:x2]
-                print(f"[Preprocess] Crop via shape+solidity (detail check)")
-
-        # 2) FALLBACK: HoughCircles (kode lama, tetap dipertahankan)
-        if crop is None:
-            r_min = int(min(h_s, w_s) / 6)
-            r_max = int(min(h_s, w_s) / 2.2)
-            circles = cv2.HoughCircles(
-                blur_small, cv2.HOUGH_GRADIENT,
-                dp=1.0, minDist=w_s,
-                param1=80, param2=35,
-                minRadius=r_min, maxRadius=r_max
-            )
-            if circles is not None:
-                circles = np.round(circles[0]).astype(int)
-                cx, cy, cr = max(circles, key=lambda c: c[2])
-                pad = int(cr * 0.15)
-                x1 = max(0, int((cx - cr - pad) / scale))
-                y1 = max(0, int((cy - cr - pad) / scale))
-                x2 = min(w_orig, int((cx + cr + pad) / scale))
-                y2 = min(h_orig, int((cy + cr + pad) / scale))
-                if (x2 - x1) > 30 and (y2 - y1) > 30:
-                    crop = img[y1:y2, x1:x2]
-                    print(f"[Preprocess] Crop via HoughCircles (detail check), radius={cr}")
+                print(f"[Preprocess] Crop via HoughCircles (detail check), radius={cr}")
 
     if crop is None:
-        # 3) FALLBACK: kontur via Canny (kode lama, tidak berubah)
         edges = cv2.Canny(blur_small, 30, 120)
         kernel = np.ones((9, 9), np.uint8)
         edges = cv2.dilate(edges, kernel, iterations=2)
@@ -159,42 +146,31 @@ def preprocess_image_from_array(img, use_hough_first=False):
                 x1, y1 = max(0, x-pad_x), max(0, y-pad_y)
                 x2, y2 = min(w_orig, x+w+pad_x), min(h_orig, y+h+pad_y)
                 crop = img[y1:y2, x1:x2]
+                print("[Preprocess] Crop via Canny contour")
                 break
 
     if crop is None:
-        # 4) FALLBACK TERAKHIR: center-crop 64% area,
-        # jauh lebih aman drpd full-frame krn masih motong sudut2 background
-        cx1 = int(w_orig * 0.18)
-        cy1 = int(h_orig * 0.18)
-        cx2 = int(w_orig * 0.82)
-        cy2 = int(h_orig * 0.82)
-        crop = img[cy1:cy2, cx1:cx2]
-        print("[Preprocess] WARNING: semua metode segmentasi gagal, pakai center-crop 64%")
+        crop = img.copy()
+        print("[Preprocess] WARNING: fallback ke full frame (img.copy())")
 
-    # STEP 2 — RESIZE
+    # ── Simpan crop asli (BGR) SEBELUM diproses lebih lanjut, buat display/GradCAM ──
     crop_for_display = crop.copy()
+    crop_display_resized = cv2.resize(crop_for_display, (224, 224))
+
+    # STEP 2-6 tetap sama persis seperti sebelumnya
     resized = cv2.resize(crop, (224, 224))
-
-    # STEP 3 — GRAYSCALE
     gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
-    # STEP 4 — CLAHE
     clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16,16))
     enhanced = clahe.apply(gray_final)
-
-    # STEP 5 — SHARPENING
     kernel_sharpen = np.array([
         [ 0, -0.5,  0],
         [-0.5, 3.0, -0.5],
         [ 0, -0.5,  0]
     ], dtype=np.float32)
     sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-
-    # STEP 6 — BACK TO RGB
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
-    crop_display_resized = cv2.resize(crop_for_display, (224, 224))
-    return final, crop_display_resized 
 
+    return final, crop_display_resized
 # ─────────────────────────────────────────────
 # GRADCAM
 # ─────────────────────────────────────────────
@@ -407,17 +383,22 @@ def predict():
     results = []
     for i, egg in enumerate(eggs):
 
-        # ── Preprocessing → model (skrg return 2 nilai) ──
+        # ── Preprocessing → model (return 2 nilai: tensor final + crop display) ──
         processed, crop_display = preprocess_image_from_array(egg)
         processed_float = processed.astype('float32') / 255.0
 
-        # ── Display crop (BGR, untuk UI) — SEKARANG JUJUR ──
+        # ── Display crop (BGR, untuk UI) — SEKARANG JUJUR, sama dgn yg dipakai model ──
         _, buffer = cv2.imencode(
             '.jpg', crop_display,
             [cv2.IMWRITE_JPEG_QUALITY, 80]
         )
         crop_b64 = base64.b64encode(buffer).decode('utf-8')
         egg_display = crop_display  # dipakai juga sbg background GradCAM
+
+        input_tensor = np.expand_dims(processed_float, axis=0)
+        prob_retak = float(model.predict(input_tensor, verbose=0)[0][0])
+        prob_normal = 1 - prob_retak
+        tingkat_kelayakan = prob_normal * 100
 
         # ── Zona klasifikasi ──────────────────────────
         if prob_retak < thr_low:
@@ -441,8 +422,6 @@ def predict():
         )
 
         # ── GradCAM ───────────────────────────────────
-        # Hanya generate kalau PERLU CEK atau TIDAK LAYAK
-        # supaya tidak buang waktu untuk telur yang jelas LAYAK
         gradcam_b64 = None
         if zona in ("PERLU CEK", "TIDAK LAYAK"):
             gradcam_b64 = generate_gradcam(processed_float, egg_display.copy())
@@ -462,7 +441,7 @@ def predict():
             "normalProb":       round(prob_normal * 100, 2),
             "retakProb":        round(prob_retak * 100, 2),
             "crop_image":       crop_b64,
-            "gradcam_image":    gradcam_b64,   # None kalau LAYAK
+            "gradcam_image":    gradcam_b64,
         })
 
     layak       = sum(1 for r in results if r["zona"] == "LAYAK")
@@ -478,7 +457,6 @@ def predict():
         "threshold_high": round(thr_high, 2),
         "results":        results
     })
-
 
 # ─────────────────────────────────────────────
 # ENDPOINT KHUSUS DETAIL CHECK (3 sudut)
@@ -510,11 +488,11 @@ def predict_single():
     if img is None:
         return jsonify({"error": "Gambar tidak bisa dibaca"}), 400
 
-    # Preprocess (skrg return 2 nilai)
+    # Preprocess (return 2 nilai: tensor final + crop display)
     processed, crop_display = preprocess_image_from_array(img, use_hough_first=True)
     processed_float = processed.astype('float32') / 255.0
 
-    # Display — SEKARANG JUJUR, nunjukkin crop yg beneran dipakai
+    # Display — SEKARANG JUJUR, nunjukkin crop yang beneran dipakai model
     _, buffer = cv2.imencode('.jpg', crop_display, [cv2.IMWRITE_JPEG_QUALITY, 80])
     crop_b64 = base64.b64encode(buffer).decode('utf-8')
     egg_display = crop_display
@@ -536,7 +514,7 @@ def predict_single():
 
     confidence = tingkat_kelayakan if is_normal else prob_retak * 100
 
-    print(f"[DETAIL CHECK] prob_retak={prob_retak:.4f} -> {zona} ({tingkat_kelayakan:.1f}%)")   
+    print(f"[DETAIL CHECK] prob_retak={prob_retak:.4f} -> {zona} ({tingkat_kelayakan:.1f}%)")
 
     # GradCAM selalu di-generate untuk detail check
     gradcam_b64 = generate_gradcam(processed_float, egg_display.copy())
@@ -552,7 +530,6 @@ def predict_single():
         "threshold_low":    round(thr_low,  2),
         "threshold_high":   round(thr_high, 2),
     })
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
