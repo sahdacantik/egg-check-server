@@ -21,7 +21,7 @@ print("[STARTUP] Model warmed up, input shape defined.")
 # ─────────────────────────────────────────────
 # PREPROCESSING
 # ─────────────────────────────────────────────
-def preprocess_image_from_array(img):
+def preprocess_image_from_array(img, use_hough_first=False):
     h_orig, w_orig = img.shape[:2]
 
     if len(img.shape) == 2:
@@ -30,56 +30,77 @@ def preprocess_image_from_array(img):
     # STEP 1 — DETEKSI & CROP TELUR
     scale = 600 / max(h_orig, w_orig)
     img_small = cv2.resize(img, (int(w_orig*scale), int(h_orig*scale)))
-    gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (9,9), 2)
-    edges = cv2.Canny(blur, 30, 120)
-    kernel = np.ones((9,9), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    h_s, w_s = img_small.shape[:2]
+    gray_small = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+    blur_small = cv2.GaussianBlur(gray_small, (9, 9), 2)
 
-    crop = img.copy()
-    if contours:
-        contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
-        h_s, w_s = img_small.shape[:2]
-        img_small_area = h_s * w_s
-        for c in contours_sorted:
-            area = cv2.contourArea(c)
-            if area < 0.05*img_small_area or area > 0.95*img_small_area:
-                continue
-            x, y, w, h = cv2.boundingRect(c)
-            if max(w,h) / (min(w,h) + 1e-5) > 3.0:
-                continue
-            x,y,w,h = int(x/scale),int(y/scale),int(w/scale),int(h/scale)
-            pad_x, pad_y = int(w*0.08), int(h*0.08)
-            x1,y1 = max(0,x-pad_x), max(0,y-pad_y)
-            x2,y2 = min(w_orig,x+w+pad_x), min(h_orig,y+h+pad_y)
-            crop = img[y1:y2, x1:x2]
-            break
+    crop = None
 
-    # STEP 2 — RESIZE
+    if use_hough_first:
+        # STRATEGI KHUSUS DETAIL CHECK: HoughCircles duluan.
+        # Lebih tahan terhadap background polos berkontras rendah
+        # dibanding Canny, cocok untuk foto mentah 1 sudut (bukan hasil crop nampan).
+        r_min = int(min(h_s, w_s) / 6)
+        r_max = int(min(h_s, w_s) / 2.2)
+        circles = cv2.HoughCircles(
+            blur_small, cv2.HOUGH_GRADIENT,
+            dp=1.0, minDist=w_s,
+            param1=80, param2=35,
+            minRadius=r_min, maxRadius=r_max
+        )
+        if circles is not None:
+            circles = np.round(circles[0]).astype(int)
+            cx, cy, cr = max(circles, key=lambda c: c[2])
+            pad = int(cr * 0.15)
+            x1 = max(0, int((cx - cr - pad) / scale))
+            y1 = max(0, int((cy - cr - pad) / scale))
+            x2 = min(w_orig, int((cx + cr + pad) / scale))
+            y2 = min(h_orig, int((cy + cr + pad) / scale))
+            if (x2 - x1) > 30 and (y2 - y1) > 30:
+                crop = img[y1:y2, x1:x2]
+                print(f"[Preprocess] Crop via HoughCircles (detail check), radius={cr}")
+
+    if crop is None:
+        # STRATEGI DEFAULT (tidak berubah): deteksi kontur via Canny
+        edges = cv2.Canny(blur_small, 30, 120)
+        kernel = np.ones((9, 9), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=2)
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if contours:
+            contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
+            img_small_area = h_s * w_s
+            for c in contours_sorted:
+                area = cv2.contourArea(c)
+                if area < 0.05*img_small_area or area > 0.95*img_small_area:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                if max(w, h) / (min(w, h) + 1e-5) > 3.0:
+                    continue
+                x, y, w, h = int(x/scale), int(y/scale), int(w/scale), int(h/scale)
+                pad_x, pad_y = int(w*0.08), int(h*0.08)
+                x1, y1 = max(0, x-pad_x), max(0, y-pad_y)
+                x2, y2 = min(w_orig, x+w+pad_x), min(h_orig, y+h+pad_y)
+                crop = img[y1:y2, x1:x2]
+                break
+
+    if crop is None:
+        crop = img.copy()
+
+    # STEP 2-6 tetap sama persis seperti sebelumnya
     resized = cv2.resize(crop, (224, 224))
-
-    # STEP 3 — GRAYSCALE
     gray_final = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
-    # STEP 4 — CLAHE
     clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16,16))
     enhanced = clahe.apply(gray_final)
-
-    # STEP 5 — SHARPENING
     kernel_sharpen = np.array([
         [ 0, -0.5,  0],
         [-0.5, 3.0, -0.5],
         [ 0, -0.5,  0]
     ], dtype=np.float32)
     sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-
-    # STEP 6 — BACK TO RGB
     final = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)
     return final
-
 
 # ─────────────────────────────────────────────
 # GRADCAM
@@ -407,7 +428,7 @@ def predict_single():
     crop_b64 = base64.b64encode(buffer).decode('utf-8')
 
     # Preprocess
-    processed = preprocess_image_from_array(img)
+    processed = preprocess_image_from_array(img, use_hough_first=True)
     processed_float = processed.astype('float32') / 255.0
 
     input_tensor = np.expand_dims(processed_float, axis=0)
