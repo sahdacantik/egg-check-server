@@ -539,6 +539,8 @@ def predict_single():
 
     confidence = tingkat_kelayakan if is_normal else prob_retak * 100
 
+    print(f"[DETAIL CHECK] prob_retak={prob_retak:.4f} -> {zona} ({tingkat_kelayakan:.1f}%)")   
+
     # GradCAM selalu di-generate untuk detail check
     gradcam_b64 = generate_gradcam(processed_float, egg_display.copy())
 
