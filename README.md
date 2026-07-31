@@ -139,7 +139,7 @@ The generated visualization highlights image regions contributing most to the CN
 
 This backend serves the Flutter application available in:
 
-➡️ **[Egg Check Mobile](https://github.com/sahdacantik/egg_check_mobile)**
+➡️ **[Egg Check Mobile](https://github.com/sahdacantik/egg-check-mobile)**
 
 ---
 
